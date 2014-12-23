@@ -144,21 +144,19 @@ fn initialize_layers<C>(compositor: &mut C,
     fn build(metadata: &mut Vec<LayerMetadata>,
              stacking_context: &StackingContext,
              page_position: &Point2D<Au>) {
-        let page_position = stacking_context.bounds.origin + *page_position;
-        match stacking_context.layer {
-            None => {}
-            Some(ref paint_layer) => {
-                metadata.push(LayerMetadata {
-                    id: paint_layer.id,
-                    position:
-                        Rect(Point2D(page_position.x.to_nearest_px() as uint,
-                                     page_position.y.to_nearest_px() as uint),
-                             Size2D(stacking_context.bounds.size.width.to_nearest_px() as uint,
-                                    stacking_context.bounds.size.height.to_nearest_px() as uint)),
-                    background_color: paint_layer.background_color,
-                    scroll_policy: paint_layer.scroll_policy,
-                })
-            }
+        let page_position = stacking_context.bounds.origin + stacking_context.overflow.origin +
+            *page_position;
+        if let Some(ref paint_layer) = stacking_context.layer {
+            metadata.push(LayerMetadata {
+                id: paint_layer.id,
+                position:
+                    Rect(Point2D(page_position.x.to_nearest_px() as i32,
+                                 page_position.y.to_nearest_px() as i32),
+                         Size2D(stacking_context.overflow.size.width.to_nearest_px() as i32,
+                                stacking_context.overflow.size.height.to_nearest_px() as i32)),
+                background_color: paint_layer.background_color,
+                scroll_policy: paint_layer.scroll_policy,
+            })
         }
 
         for kid in stacking_context.display_list.children.iter() {
@@ -350,15 +348,14 @@ impl<C> PaintTask<C> where C: PaintListener + Send {
               layer_id: LayerId) {
         time::profile(time::PaintingCategory, None, self.time_profiler_chan.clone(), || {
             // Bail out if there is no appropriate stacking context.
-            let stacking_context = match self.root_stacking_context {
-                Some(ref stacking_context) => {
-                    match display_list::find_stacking_context_with_layer_id(stacking_context,
-                                                                            layer_id) {
-                        Some(stacking_context) => stacking_context,
-                        None => return,
-                    }
+            let stacking_context = if let Some(ref stacking_context) = self.root_stacking_context {
+                match display_list::find_stacking_context_with_layer_id(stacking_context,
+                                                                        layer_id) {
+                    Some(stacking_context) => stacking_context,
+                    None => return,
                 }
-                None => return,
+            } else {
+                return
             };
 
             // Divide up the layer into tiles and distribute them to workers via a simple round-
@@ -513,8 +510,13 @@ impl WorkerThread {
                 transient_clip: None,
             };
 
+            // Apply a translation to start at the boundaries of the stacking context, since the
+            // layer's origin starts at its overflow rect's origin.
+            let tile_bounds = tile.page_rect.translate(
+                &Point2D(stacking_context.overflow.origin.x.to_subpx() as AzFloat,
+                         stacking_context.overflow.origin.y.to_subpx() as AzFloat));
+
             // Apply the translation to paint the tile we want.
-            let tile_bounds = tile.page_rect;
             let matrix: Matrix2D<AzFloat> = Matrix2D::identity();
             let matrix = matrix.scale(scale as AzFloat, scale as AzFloat);
             let matrix = matrix.translate(-tile_bounds.origin.x as AzFloat,
@@ -526,7 +528,7 @@ impl WorkerThread {
             // Draw the display list.
             profile(time::PaintingPerTileCategory, None, self.time_profiler_sender.clone(), || {
                 stacking_context.optimize_and_draw_into_context(&mut paint_context,
-                                                                &tile.page_rect,
+                                                                &tile_bounds,
                                                                 &matrix,
                                                                 None);
                 paint_context.draw_target.flush();
